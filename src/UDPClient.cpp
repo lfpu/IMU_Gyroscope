@@ -1,0 +1,205 @@
+
+#include <Arduino.h>
+#include <WebServer.h>
+#include "imu_protocol.h" // 你项目中的 C 风格打包API: imu_pkt_* （已存在）
+#include <event_groups.h>
+#include "MPU6886.h"
+
+#include "lwip/err.h"
+#include "lwip/sockets.h"
+
+// 如果你的工程使用 <WiFi.h> / <WiFiAP.h>，可按需包含
+#include <WiFi.h>
+
+static const char *TAG = "IMU_UDP_TX";
+// ====== 用户配置 ======
+#define WIFI_SSID "ESP32-S3-Test"
+#define WIFI_PASS "15928798645"
+
+// --- 发送目标 ---
+// 1) 单播（默认）：填写你 PC 的 IP 与端口
+#define UDP_TARGET_IP "192.168.4.2"
+#define UDP_TARGET_PORT 10000
+
+// 2) 可选广播开关（需要同网段；AP 缺省网段广播地址 192.168.4.255）
+#define USE_BROADCAST 0
+#define UDP_BROADCAST_IP "192.168.4.255"
+
+// 发送频率（Hz）
+#define SEND_HZ 100
+
+// 任务栈/优先级
+#define TASK_STACK 4096
+#define TASK_PRIO 5
+
+// 单位标志：与 PC 接收端统一（加速度 m/s^2，角速度 rad/s）
+#define FLAGS_UNITS 0 // 来自协议定义（IMUProtocol/imu_protocol）
+
+// ====== 全局对象 ======
+
+MPU6886 IMU;
+
+static void WIFI_Init()
+{
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    Serial.printf("[WiFi] STA Connecting to %s ...\n", WIFI_SSID);
+    uint32_t t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000)
+    {
+        delay(300);
+        Serial.print(".");
+    }
+    Serial.println();
+    Serial.printf("[WiFi] %s  IP:%s\n", WiFi.status() == WL_CONNECTED ? "Connected" : "Not connected", WiFi.localIP().toString().c_str());
+}
+static uint32_t GetDeviceID(void)
+{
+    uint8_t mac[6];
+    esp_read_mac(mac, esp_mac_type_t::ESP_MAC_WIFI_SOFTAP);
+    // FNV-1a 32-bit
+    uint32_t hash = 2166136261u;
+    for (int i = 0; i < 6; ++i)
+    {
+        hash ^= mac[i];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+static void udp_sender_task(void *)
+{
+  // 1) 建立 UDP socket（IPv4）
+  int sock = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+  if (sock < 0)
+  {
+    ESP_LOGE(TAG, "socket failed, errno=%d", errno);
+    vTaskDelete(NULL);
+    return;
+  }
+
+  // 2) 可选：广播 / 发送缓冲
+  if (USE_BROADCAST)
+  {
+    int yes = 1;
+    ::setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &yes, sizeof(yes)); // 允许广播
+  }
+  // 尝试增大发送缓冲（底层可能忽略，但设置无害）
+  int sndbuf = 8 * 1024;
+  ::setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)); // 适度增大发送队列
+  // 3) 目标地址
+  struct sockaddr_in dest = {};
+  dest.sin_family = AF_INET;
+  dest.sin_port = htons(UDP_TARGET_PORT);
+  const char *target_ip = USE_BROADCAST ? UDP_BROADCAST_IP : UDP_TARGET_IP;
+  if (inet_pton(AF_INET, target_ip, &dest.sin_addr) != 1)
+  {
+    ESP_LOGE(TAG, "inet_pton failed for %s", target_ip);
+    ::close(sock);
+    vTaskDelete(NULL);
+    return;
+  }
+
+  ESP_LOGI(TAG, "UDP socket ready -> %s:%d (broadcast=%d)",
+           target_ip, UDP_TARGET_PORT, (int)USE_BROADCAST);
+
+  // 4) 定时节拍：改为 vTaskDelayUntil 实现稳定固定周期（避免瞬时连发）
+  const TickType_t period_ticks = pdMS_TO_TICKS(1000 / SEND_HZ);
+  TickType_t last_wake = xTaskGetTickCount();
+
+  // 5) 发送循环
+  uint32_t seq = 0;
+  uint8_t buffer[256];
+  imu_pkt_builder_t pb;
+
+  float ax = 0, ay = 0, az = 0;
+  float gx = 0, gy = 0, gz = 0;
+  float temp = 0;
+  uint32_t deviceID= GetDeviceID();
+  for (;;)
+  {
+    // 5.1 读取 IMU（示例调用：按你的驱动/封装调整）
+    IMU.getDatas(&ax, &ay, &az, &gx, &gy, &gz, &temp);
+
+    // 5.2 时间戳（微秒）
+    uint64_t t_us = (uint64_t)esp_timer_get_time(); // 微秒级
+
+    // 5.3 封包（Header + TLV[ACCEL, GYRO, TEMP] + CRC）
+    imu_pkt_reset(&pb, buffer, sizeof(buffer));
+    imu_pkt_begin(&pb, seq++, t_us, FLAGS_UNITS, deviceID); // 与 PC 端统一单位：m/s^2 + rad/s
+
+    float acc[3] = {ax, ay, az};
+    float gyr[3] = {gx, gy, gz};
+    imu_pkt_add_tlv(&pb, TLV_ACCEL, acc, sizeof(acc)); // TLV 类型来自协议定义
+    imu_pkt_add_tlv(&pb, TLV_GYRO, gyr, sizeof(gyr));
+    imu_pkt_add_tlv(&pb, TLV_TEMP, &temp, sizeof(float));
+
+    int plen = imu_pkt_finalize(&pb);
+    if (plen < 0)
+    {
+      ESP_LOGW(TAG, "packet finalize failed");
+      // 保守退避
+      vTaskDelay(pdMS_TO_TICKS(5));
+      vTaskDelayUntil(&last_wake, period_ticks);
+      continue;
+    }
+
+    // 5.4 发送（统一处理暂时性背压：ENOBUFS / ENOMEM）
+    int ret = ::sendto(sock, buffer, plen, 0, (struct sockaddr *)&dest, sizeof(dest));
+    if (ret < 0)
+    {
+      int err = errno;
+      if (err == ENOBUFS || err == ENOMEM /*=12，常见于 lwIP 瞬时缓冲不足*/)
+      {
+        // 小睡退避后继续：避免刷屏报错与进一步放大突发
+        vTaskDelay(pdMS_TO_TICKS(10)); // 5~20ms 之间按需微调
+      }
+      else
+      {
+        ESP_LOGE(TAG, "sendto failed, errno=%d", err);
+        vTaskDelay(pdMS_TO_TICKS(50));
+      }
+    }
+
+    // 5.5 固定周期：稳定的 100Hz（或 SEND_HZ）
+    vTaskDelayUntil(&last_wake, period_ticks); // 核心节拍控制
+  }
+
+  // never reach
+  // ::close(sock);
+  // vTaskDelete(NULL);
+}
+void app_main(void)
+{
+  WIFI_Init(); // STA
+  // 启动 UDP 发送任务
+  xTaskCreatePinnedToCore(udp_sender_task, "udp_sender", TASK_STACK, NULL, TASK_PRIO, NULL, tskNO_AFFINITY);
+}
+void setup()
+{
+  pinMode(2, INPUT);
+  Serial.begin(9600);
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(400000); // MPU6886 支持 400kHz I2C
+
+  IMU = MPU6886();
+  uint8_t whoami = 0;
+  if (IMU.readRegs(REG_WHO_AM_I, &whoami, 1))
+  {
+    Serial.print("WHO_AM_I = 0x");
+    Serial.println(whoami, HEX);
+  }
+  else
+  {
+    Serial.println("Read WHO_AM_I failed!");
+  }
+
+  app_main();
+}
+void loop()
+{
+  // 可选：保留心跳日志
+  Serial.println("running...");
+
+  delay(1000);
+}
